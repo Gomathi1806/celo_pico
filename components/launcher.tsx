@@ -31,7 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   getConnectedWallet,
   getWalletAddress,
-  isMiniPayEnvironment,
+  detectInjectedProvider,
   resolveNetwork,
   type SupportedNetwork,
 } from "@/lib/minipay-wallet";
@@ -97,13 +97,16 @@ export function Launcher() {
   const config = NETWORK_CONFIG[selectedNetwork];
   const IS_MAINNET = selectedNetwork === "celo";
 
-  // Detect MiniPay and connect wallet
+  // Detect any injected provider (polls up to 2s — MiniPay sometimes
+  // injects window.ethereum after React mounts).
   useEffect(() => {
-    const detected = isMiniPayEnvironment();
-    setIsMiniPay(detected);
-    if (!detected) return;
-
+    let cancelled = false;
     (async () => {
+      const result = await detectInjectedProvider(2000);
+      if (cancelled) return;
+      setIsMiniPay(result.available);
+      if (!result.available) return;
+
       try {
         const address = await getWalletAddress(selectedNetwork);
         setWalletAddress(address);
@@ -123,7 +126,8 @@ export function Launcher() {
         setCusdBalance("?");
       }
     })();
-  }, [selectedNetwork, config.chain, config.cusd]);
+    return () => { cancelled = true; };
+  }, [selectedNetwork, config.chain, config.cusd, config.cusdDecimals]);
 
   const tool = TOOLS.find((t) => t.id === activeId)!;
 
@@ -235,13 +239,16 @@ export function Launcher() {
         </div>
       </header>
 
-      {/* Not inside MiniPay */}
+      {/* No injected wallet detected */}
       {isMiniPay === false && (
         <Alert>
-          <AlertTitle>Open in MiniPay</AlertTitle>
+          <AlertTitle>Wallet not detected</AlertTitle>
           <AlertDescription>
-            pico settles payments via your MiniPay wallet on Celo. Open this
-            URL inside the MiniPay app to use it.
+            pico needs an injected Ethereum wallet (MiniPay on Celo). Open
+            this URL inside the MiniPay app. If you&apos;re already in
+            MiniPay and still see this, try refreshing — the wallet provider
+            is sometimes injected late. Check the browser console for
+            details.
           </AlertDescription>
         </Alert>
       )}

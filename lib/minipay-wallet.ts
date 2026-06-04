@@ -21,10 +21,42 @@ const CHAIN_MAP = {
   "celo-alfajores": { chainId: 44787, chainIdHex: "0xAEF3" as const },
 } as const;
 
-// Detect MiniPay — Opera injects window.ethereum with isMiniPay = true
+// Strict MiniPay flag (Opera sets this in the production app)
 export function isMiniPayEnvironment(): boolean {
   if (typeof window === "undefined") return false;
   return !!(window.ethereum as { isMiniPay?: boolean } | undefined)?.isMiniPay;
+}
+
+// Lenient detection — any injected EIP-1193 provider counts.
+// MiniPay's developer/site-tester mode may inject window.ethereum without
+// setting the isMiniPay brand flag. Poll up to ~2s because the provider is
+// often injected after React mounts.
+export async function detectInjectedProvider(timeoutMs = 2000): Promise<{
+  available: boolean;
+  isMiniPay: boolean;
+  providerKeys: string[];
+}> {
+  if (typeof window === "undefined") {
+    return { available: false, isMiniPay: false, providerKeys: [] };
+  }
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (window.ethereum) {
+      const provider = window.ethereum as Record<string, unknown>;
+      const result = {
+        available: true,
+        isMiniPay: provider.isMiniPay === true,
+        providerKeys: Object.keys(provider).filter((k) => k.startsWith("is")),
+      };
+      // eslint-disable-next-line no-console
+      console.log("[pico] injected provider detected:", result);
+      return result;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  // eslint-disable-next-line no-console
+  console.warn("[pico] no injected ethereum provider after", timeoutMs, "ms");
+  return { available: false, isMiniPay: false, providerKeys: [] };
 }
 
 function getThirdwebClient() {
