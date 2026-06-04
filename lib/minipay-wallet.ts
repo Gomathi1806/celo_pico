@@ -1,0 +1,145 @@
+"use client";
+
+import { createThirdwebClient } from "thirdweb";
+import { createWalletAdapter } from "thirdweb/wallets";
+import { wrapFetchWithPayment } from "thirdweb/x402";
+
+export type SupportedNetwork = "celo" | "celo-alfajores";
+
+export function resolveNetwork(raw: string): SupportedNetwork {
+  const lower = raw.toLowerCase();
+  if (lower === "celo" || lower === "eip155:42220") return "celo";
+  return "celo-alfajores";
+}
+
+export const DEFAULT_NETWORK = resolveNetwork(
+  (process.env.NEXT_PUBLIC_X402_NETWORK ?? "celo-alfajores").trim()
+);
+
+const CHAIN_MAP = {
+  celo:            { chainId: 42220, chainIdHex: "0xA4EC" as const },
+  "celo-alfajores": { chainId: 44787, chainIdHex: "0xAEF3" as const },
+} as const;
+
+// Detect MiniPay — Opera injects window.ethereum with isMiniPay = true
+export function isMiniPayEnvironment(): boolean {
+  if (typeof window === "undefined") return false;
+  return !!(window.ethereum as { isMiniPay?: boolean } | undefined)?.isMiniPay;
+}
+
+function getThirdwebClient() {
+  return createThirdwebClient({
+    clientId: process.env.NEXT_PUBLIC_THIRDWEB_CLIENT_ID ?? "",
+  });
+}
+
+export type ConnectedWallet = {
+  address: `0x${string}`;
+  fetchWithPay: ReturnType<typeof wrapFetchWithPayment>;
+};
+
+let cached: ConnectedWallet | null = null;
+let cachedNetwork: SupportedNetwork | null = null;
+
+/**
+ * Connects MiniPay's window.ethereum to thirdweb's x402 payment client.
+ *
+ * Instead of importing viem types (which clash with thirdweb's internal viem bundle),
+ * we build a thirdweb Account directly from window.ethereum's RPC methods.
+ * thirdweb's wrapFetchWithPayment uses signTypedData to sign EIP-2612 (cUSD)
+ * or EIP-3009 (USDC) — both are supported by MiniPay's injected provider.
+ */
+export async function getConnectedWallet(
+  network: SupportedNetwork = DEFAULT_NETWORK
+): Promise<ConnectedWallet> {
+  if (cached && cachedNetwork === network) return cached;
+
+  const provider = window.ethereum;
+  if (!provider) throw new Error("No wallet. Open inside MiniPay.");
+
+  const { chainIdHex, chainId } = CHAIN_MAP[network];
+
+  // Switch to Celo if needed
+  try {
+    const current = (await provider.request({ method: "eth_chainId" })) as string;
+    if (current.toLowerCase() !== chainIdHex.toLowerCase()) {
+      await provider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: chainIdHex }],
+      });
+    }
+  } catch { /* tx will fail naturally if wrong chain */ }
+
+  const accounts = (await provider.request({
+    method: "eth_requestAccounts",
+  })) as `0x${string}`[];
+  const address = accounts[0];
+  if (!address) throw new Error("Wallet returned no address.");
+
+  // Build a thirdweb Account directly from window.ethereum — no viem types crossing
+  const adaptedAccount = {
+    address,
+    async sendTransaction(tx: { to?: string | null; value?: bigint; data?: string; chainId?: number }) {
+      const txHash = await provider.request({
+        method: "eth_sendTransaction",
+        params: [{
+          from: address,
+          to: tx.to ?? undefined,
+          value: tx.value ? `0x${tx.value.toString(16)}` : undefined,
+          data: tx.data,
+        }],
+      }) as `0x${string}`;
+      return { transactionHash: txHash };
+    },
+    async signMessage({ message }: { message: string | { raw: `0x${string}` } }) {
+      const msg = typeof message === "string" ? message : message.raw;
+      return provider.request({
+        method: "personal_sign",
+        params: [msg, address],
+      }) as Promise<`0x${string}`>;
+    },
+    // thirdweb calls this to sign EIP-2612 permit (cUSD) or EIP-3009 (USDC)
+    async signTypedData(typedData: {
+      domain: Record<string, unknown>;
+      types: Record<string, unknown>;
+      primaryType: string;
+      message: Record<string, unknown>;
+    }) {
+      const payload = JSON.stringify({
+        types: typedData.types,
+        domain: typedData.domain,
+        primaryType: typedData.primaryType,
+        message: typedData.message,
+      });
+      return provider.request({
+        method: "eth_signTypedData_v4",
+        params: [address, payload],
+      }) as Promise<`0x${string}`>;
+    },
+  };
+
+  // Wrap into a thirdweb Wallet (needed by wrapFetchWithPayment).
+  // Cast adaptedAccount — thirdweb's Account type references its bundled viem which
+  // differs structurally from our project's viem. Runtime behavior is identical.
+  const thirdwebWallet = createWalletAdapter({
+    client: getThirdwebClient(),
+    adaptedAccount: adaptedAccount as any,
+    chain: { id: chainId } as any,
+    onDisconnect: () => { cached = null; cachedNetwork = null; },
+    switchChain: async () => {},
+  });
+
+  const fetchWithPay = wrapFetchWithPayment(fetch, getThirdwebClient(), thirdwebWallet);
+
+  const next = { address, fetchWithPay };
+  cached = next;
+  cachedNetwork = network;
+  return next;
+}
+
+export async function getWalletAddress(
+  network: SupportedNetwork = DEFAULT_NETWORK
+): Promise<`0x${string}`> {
+  const { address } = await getConnectedWallet(network);
+  return address;
+}
