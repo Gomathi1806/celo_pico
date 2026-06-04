@@ -171,13 +171,22 @@ export function Launcher() {
       //    — MiniPay shows native sign prompt, no custom UI needed
       // 4. fetchWithPay retries with X-PAYMENT header
       // 5. Server settles on Celo via thirdweb facilitator → returns result
+      // 30s timeout so user isn't stuck on a hung signature prompt.
       let res: Response;
       try {
-        res = await fetchWithPay(tool.endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-        });
+        res = await Promise.race([
+          fetchWithPay(tool.endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          }),
+          new Promise<Response>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("Payment timed out after 30s. Did you sign the prompt?")),
+              30_000
+            )
+          ),
+        ]);
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
         throw new Error(`Payment failed: ${reason}`);

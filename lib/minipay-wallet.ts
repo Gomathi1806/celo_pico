@@ -27,10 +27,9 @@ export function isMiniPayEnvironment(): boolean {
   return !!(window.ethereum as { isMiniPay?: boolean } | undefined)?.isMiniPay;
 }
 
-// Lenient detection — any injected EIP-1193 provider counts.
-// MiniPay's developer/site-tester mode may inject window.ethereum without
-// setting the isMiniPay brand flag. Poll up to ~2s because the provider is
-// often injected after React mounts.
+// Strict MiniPay detection with polling — checks isMiniPay flag.
+// Polls up to ~2s because MiniPay sometimes injects window.ethereum after
+// React mounts. Rejects MetaMask and other non-MiniPay wallets cleanly.
 export async function detectInjectedProvider(timeoutMs = 2000): Promise<{
   available: boolean;
   isMiniPay: boolean;
@@ -43,20 +42,34 @@ export async function detectInjectedProvider(timeoutMs = 2000): Promise<{
   while (Date.now() - start < timeoutMs) {
     if (window.ethereum) {
       const provider = window.ethereum as Record<string, unknown>;
+      const isMiniPay = provider.isMiniPay === true;
+      const providerKeys = Object.keys(provider).filter((k) => k.startsWith("is"));
       const result = {
-        available: true,
-        isMiniPay: provider.isMiniPay === true,
-        providerKeys: Object.keys(provider).filter((k) => k.startsWith("is")),
+        available: isMiniPay,  // only count as available if it's MiniPay
+        isMiniPay,
+        providerKeys,
       };
       // eslint-disable-next-line no-console
-      console.log("[pico] injected provider detected:", result);
-      return result;
+      console.log("[pico] injected provider detected:", { ...result, providerKeys });
+      if (isMiniPay) return result;
+      // Keep polling — MiniPay might inject later, overriding MetaMask
     }
     await new Promise((r) => setTimeout(r, 100));
   }
+  const provider = (typeof window !== "undefined" ? window.ethereum : undefined) as
+    | Record<string, unknown>
+    | undefined;
+  const providerKeys = provider
+    ? Object.keys(provider).filter((k) => k.startsWith("is"))
+    : [];
   // eslint-disable-next-line no-console
-  console.warn("[pico] no injected ethereum provider after", timeoutMs, "ms");
-  return { available: false, isMiniPay: false, providerKeys: [] };
+  console.warn(
+    "[pico] MiniPay not detected after",
+    timeoutMs,
+    "ms. Found providers:",
+    providerKeys
+  );
+  return { available: false, isMiniPay: false, providerKeys };
 }
 
 function getThirdwebClient() {
