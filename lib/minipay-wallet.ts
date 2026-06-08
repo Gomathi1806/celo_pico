@@ -143,19 +143,25 @@ export async function getConnectedWallet(
         params: [msg, address],
       }) as Promise<`0x${string}`>;
     },
-    // thirdweb calls this to sign EIP-2612 permit (cUSD) or EIP-3009 (USDC)
+    // thirdweb calls this to sign EIP-2612 permit (cUSD) or EIP-3009 (USDC).
+    // The typedData payload contains BigInts (chainId, value, nonce, deadline)
+    // which JSON.stringify can't serialize natively — use a replacer that
+    // converts BigInt → decimal string (EIP-712 / JSON-RPC standard format).
     async signTypedData(typedData: {
       domain: Record<string, unknown>;
       types: Record<string, unknown>;
       primaryType: string;
       message: Record<string, unknown>;
     }) {
-      const payload = JSON.stringify({
-        types: typedData.types,
-        domain: typedData.domain,
-        primaryType: typedData.primaryType,
-        message: typedData.message,
-      });
+      const payload = JSON.stringify(
+        {
+          types: typedData.types,
+          domain: typedData.domain,
+          primaryType: typedData.primaryType,
+          message: typedData.message,
+        },
+        (_key, value) => (typeof value === "bigint" ? value.toString() : value)
+      );
       return provider.request({
         method: "eth_signTypedData_v4",
         params: [address, payload],
