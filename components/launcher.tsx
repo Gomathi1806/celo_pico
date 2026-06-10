@@ -37,20 +37,23 @@ import {
 } from "@/lib/minipay-wallet";
 import { TOOLS, type Tool, type ToolId } from "@/lib/tools";
 
-// USDC on Celo (6 decimals, EIP-3009) — used for balance display
-// cUSD on Celo (18 decimals, EIP-2612) — thirdweb facilitator handles both
+// Payment asset per network — must match what the server settles in (lib/thirdweb-x402.ts).
+// Mainnet: USDC (Circle, 6 decimals) — MiniPay users primarily hold USDC.
+// Alfajores: cUSD (18 decimals) — Circle USDC isn't on Alfajores.
 const NETWORK_CONFIG = {
   celo: {
     name: "Celo",
     chain: celo,
-    cusd: "0x765DE816845861e75A25fCA122bb6898B8B1282a" as `0x${string}`,
-    cusdDecimals: 18,
+    tokenAddress: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
+    tokenSymbol: "USDC",
+    tokenDecimals: 6,
   },
   "celo-alfajores": {
     name: "Alfajores",
     chain: celoAlfajores,
-    cusd: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
-    cusdDecimals: 18,
+    tokenAddress: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
+    tokenSymbol: "cUSD",
+    tokenDecimals: 18,
   },
 } as const;
 
@@ -85,7 +88,7 @@ export function Launcher() {
   const [running, setRunning] = useState(false);
   const [isMiniPay, setIsMiniPay] = useState<boolean | null>(null);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  const [cusdBalance, setCusdBalance] = useState<string | null>(null);
+  const [balance, setBalance] = useState<string | null>(null);
 
   const [selectedNetwork, setSelectedNetwork] = useState<SupportedNetwork>(
     () =>
@@ -115,19 +118,19 @@ export function Launcher() {
           transport: http(),
         });
         const bal = await publicClient.readContract({
-          address: config.cusd,
+          address: config.tokenAddress,
           abi: ERC20_ABI,
           functionName: "balanceOf",
           args: [address as `0x${string}`],
         });
-        setCusdBalance(formatUnits(bal, config.cusdDecimals));
+        setBalance(formatUnits(bal, config.tokenDecimals));
       } catch (e) {
         console.error("Wallet init failed:", e);
-        setCusdBalance("?");
+        setBalance("?");
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedNetwork, config.chain, config.cusd, config.cusdDecimals]);
+  }, [selectedNetwork, config.chain, config.tokenAddress, config.tokenDecimals]);
 
   const tool = TOOLS.find((t) => t.id === activeId)!;
 
@@ -239,12 +242,10 @@ export function Launcher() {
       <header className="flex items-center justify-between">
         <PicoHero />
         <div className="flex flex-col items-end gap-1.5">
-          {/* Network selector — only show on dev/testnet environments */}
-          {!IS_MAINNET && (
-            <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-2 py-0.5">
-              {config.name} (testnet)
-            </span>
-          )}
+          {/* Network badge — always show, like Base PICO shows "base" */}
+          <span className="text-[10px] font-mono text-muted-foreground bg-muted/40 rounded-full px-2 py-0.5">
+            {IS_MAINNET ? "celo" : `${config.name.toLowerCase()} · testnet`}
+          </span>
         </div>
       </header>
 
@@ -262,33 +263,33 @@ export function Launcher() {
         </Alert>
       )}
 
-      {/* Wallet + cUSD balance */}
+      {/* Wallet + balance (USDC on mainnet, cUSD on Alfajores) */}
       {walletAddress && (
         <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs space-y-1">
           <div className="flex items-center justify-between gap-2">
-            <span className="text-muted-foreground">Wallet</span>
+            <span className="text-muted-foreground">Signing wallet</span>
             <span className="font-mono truncate max-w-[180px]">
               {walletAddress}
             </span>
           </div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-muted-foreground">cUSD balance</span>
+            <span className="text-muted-foreground">{config.tokenSymbol} balance</span>
             <span
               className={`font-mono font-medium ${
-                parseFloat(cusdBalance ?? "0") < 0.1
+                parseFloat(balance ?? "0") < 0.1
                   ? "text-destructive"
                   : "text-green-500"
               }`}
             >
-              {cusdBalance ?? "…"} cUSD
+              {balance ?? "…"} {config.tokenSymbol}
             </span>
           </div>
-          {parseFloat(cusdBalance ?? "0") < 0.1 && (
+          {parseFloat(balance ?? "0") < 0.1 && (
             <div className="pt-1 text-destructive">
-              ⚠ Not enough cUSD.{" "}
+              ⚠ Not enough {config.tokenSymbol}.{" "}
               {IS_MAINNET ? (
                 <span>
-                  Add cUSD on Celo to this address to use pico.
+                  Add {config.tokenSymbol} on Celo to this address to use pico.
                 </span>
               ) : (
                 <a
@@ -297,7 +298,7 @@ export function Launcher() {
                   rel="noopener noreferrer"
                   className="underline"
                 >
-                  Get free Alfajores cUSD →
+                  Get free Alfajores {config.tokenSymbol} →
                 </a>
               )}
             </div>
@@ -334,6 +335,7 @@ export function Launcher() {
         onChange={setField}
         onRun={run}
         running={running}
+        tokenSymbol={config.tokenSymbol}
       />
 
       {error && (
@@ -357,12 +359,14 @@ function ToolForm({
   onChange,
   onRun,
   running,
+  tokenSymbol,
 }: {
   tool: Tool;
   inputs: Record<string, string>;
   onChange: (name: string, value: string) => void;
   onRun: () => void;
   running: boolean;
+  tokenSymbol: string;
 }) {
   return (
     <Card>
@@ -397,7 +401,7 @@ function ToolForm({
         <div className="flex items-center justify-between">
           <span className="text-xs text-muted-foreground">
             Charged:{" "}
-            <span className="font-mono">{tool.price}</span> cUSD
+            <span className="font-mono">{tool.price}</span> {tokenSymbol}
           </span>
           <Button onClick={onRun} disabled={running}>
             {running ? (

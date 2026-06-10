@@ -33,13 +33,45 @@ function getServerClient() {
 }
 
 // Thirdweb facilitator — handles on-chain settlement via thirdweb's infrastructure.
-// Supports Celo mainnet + Alfajores testnet, cUSD (EIP-2612) and USDC (EIP-3009).
+// Supports Celo mainnet + Alfajores testnet. cUSD (EIP-2612) and USDC (EIP-3009).
 // No CDP keys or custom facilitator server needed.
 function getThirdwebFacilitator() {
   return facilitator({
     client: getServerClient(),
     serverWalletAddress: OPERATOR_ADDRESS,
   });
+}
+
+// USDC on Celo (Circle, 6 decimals) — MiniPay users primarily hold USDC, not cUSD.
+// Settling in USDC avoids "insufficient funds" errors for users who only have USDC.
+// Both USDC and cUSD are supported by thirdweb's facilitator on Celo.
+const USDC_ASSET = {
+  celo: {
+    address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
+    decimals: 6,
+    eip712: {
+      name: "USD Coin",
+      version: "2",
+      primaryType: "TransferWithAuthorization" as const, // EIP-3009
+    },
+  },
+  // Alfajores testnet doesn't have official Circle USDC — fall back to cUSD there
+  "celo-alfajores": {
+    address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
+    decimals: 18,
+    eip712: {
+      name: "Celo Dollar",
+      version: "1",
+      primaryType: "Permit" as const, // EIP-2612
+    },
+  },
+} as const;
+
+function priceToAsset(usdPrice: string, network: SupportedNetwork) {
+  const usd = parseFloat(usdPrice.replace("$", ""));
+  const asset = USDC_ASSET[network];
+  const amount = Math.round(usd * 10 ** asset.decimals).toString();
+  return { amount, asset };
 }
 
 /**
@@ -72,7 +104,9 @@ export function createToolHandler(
       paymentData,
       payTo: OPERATOR_ADDRESS,
       network: chain,
-      price,
+      // Explicitly settle in USDC (mainnet) or cUSD (alfajores) — the user's
+      // balance must be in this asset for payment to succeed.
+      price: priceToAsset(price, network),
       facilitator: getThirdwebFacilitator(),
       routeConfig: {
         description: `pico: ${toolName}`,
