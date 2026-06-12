@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { MAX_PROMPT_LENGTH, isImagePromptBlocked } from "@/lib/safety";
 import { createToolHandler } from "@/lib/thirdweb-x402";
+import { generateImage } from "@/lib/ai-providers";
 
 export const POST = createToolHandler("image", "$0.10", async (_req, body) => {
   const { prompt } = body;
@@ -15,10 +16,7 @@ export const POST = createToolHandler("image", "$0.10", async (_req, body) => {
     return NextResponse.json({ error: "Prompt contains blocked terms." }, { status: 400 });
   }
 
-  const seed = Math.floor(Math.random() * 1000000);
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-    prompt
-  )}?seed=${seed}&nologo=true&model=flux`;
+  const url = await generateImage({ prompt });
 
   return NextResponse.json({ kind: "image", url, prompt });
 });

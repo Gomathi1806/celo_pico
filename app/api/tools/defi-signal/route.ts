@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { MAX_PROMPT_LENGTH, SAFETY_SUFFIX, clampText } from "@/lib/safety";
 import { createToolHandler } from "@/lib/thirdweb-x402";
+import { generateText } from "@/lib/ai-providers";
 
 export const POST = createToolHandler("defi-signal", "$0.05", async (_req, body) => {
   const { token, context } = body;
@@ -18,19 +19,11 @@ export const POST = createToolHandler("defi-signal", "$0.05", async (_req, body)
     "Give concise, honest signals — not financial advice. Flag high-risk protocols clearly." +
     SAFETY_SUFFIX;
 
-  const res = await fetch("https://text.pollinations.ai/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: userMsg },
-      ],
-      model: "openai",
-    }),
+  const text = await generateText({
+    system,
+    user: userMsg,
+    maxTokens: 250,
   });
 
-  if (!res.ok) throw new Error(`AI provider failed: ${res.status}`);
-  const text = (await res.text()).trim();
   return NextResponse.json({ kind: "text", text, token });
 });

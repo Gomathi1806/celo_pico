@@ -1,6 +1,7 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { MAX_PROMPT_LENGTH, SAFETY_SUFFIX, clampText } from "@/lib/safety";
 import { createToolHandler } from "@/lib/thirdweb-x402";
+import { generateText } from "@/lib/ai-providers";
 
 export const POST = createToolHandler("ask", "$0.05", async (_req, body) => {
   const { question } = body;
@@ -14,19 +15,11 @@ export const POST = createToolHandler("ask", "$0.05", async (_req, body) => {
   const system =
     "You answer one question concisely. Be direct and under 60 words." + SAFETY_SUFFIX;
 
-  const res = await fetch("https://text.pollinations.ai/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: clampText(question) },
-      ],
-      model: "openai",
-    }),
+  const text = await generateText({
+    system,
+    user: clampText(question),
+    maxTokens: 200,
   });
 
-  if (!res.ok) throw new Error(`AI provider failed: ${res.status}`);
-  const text = (await res.text()).trim();
   return NextResponse.json({ kind: "text", text, question });
 });

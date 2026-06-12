@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { MAX_URL_LENGTH, SAFETY_SUFFIX } from "@/lib/safety";
 import { createToolHandler } from "@/lib/thirdweb-x402";
+import { generateText, scrapeUrl } from "@/lib/ai-providers";
 
 export const POST = createToolHandler("scrape", "$0.05", async (_req, body) => {
   const { url } = body;
@@ -11,21 +12,17 @@ export const POST = createToolHandler("scrape", "$0.05", async (_req, body) => {
     return NextResponse.json({ error: "URL too long." }, { status: 400 });
   }
 
-  const system =
-    `You are a helpful assistant. The user wants the key takeaway from this URL: ${url}. ` +
-    "Give a 2-3 sentence summary of what it covers." +
-    SAFETY_SUFFIX;
+  // Get the page content via Firecrawl (preferred) or LLM-based fallback
+  const pageContent = await scrapeUrl(url);
 
-  const res = await fetch("https://text.pollinations.ai/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [{ role: "user", content: system }],
-      model: "openai",
-    }),
+  // Summarize what we got into a 2-3 sentence takeaway
+  const text = await generateText({
+    system:
+      "You distill the key takeaway from a web page in 2-3 sentences. Be precise and avoid filler." +
+      SAFETY_SUFFIX,
+    user: `URL: ${url}\n\nContent:\n${pageContent}\n\nGive me the key takeaway.`,
+    maxTokens: 250,
   });
 
-  if (!res.ok) throw new Error(`AI provider failed: ${res.status}`);
-  const text = (await res.text()).trim();
   return NextResponse.json({ kind: "text", text, sourceUrl: url });
 });

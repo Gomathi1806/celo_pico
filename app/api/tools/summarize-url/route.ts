@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { MAX_URL_LENGTH, SAFETY_SUFFIX } from "@/lib/safety";
 import { createToolHandler } from "@/lib/thirdweb-x402";
+import { generateText, scrapeUrl } from "@/lib/ai-providers";
 
 export const POST = createToolHandler("summarize-url", "$0.05", async (_req, body) => {
   const { url } = body;
@@ -11,21 +12,15 @@ export const POST = createToolHandler("summarize-url", "$0.05", async (_req, bod
     return NextResponse.json({ error: "URL too long." }, { status: 400 });
   }
 
-  const system =
-    `Summarise the content at this URL for a busy reader: ${url}\n\n` +
-    "Give a TL;DR in 3-4 bullet points, then one sentence on why it matters." +
-    SAFETY_SUFFIX;
+  const pageContent = await scrapeUrl(url);
 
-  const res = await fetch("https://text.pollinations.ai/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [{ role: "user", content: system }],
-      model: "openai",
-    }),
+  const text = await generateText({
+    system:
+      "You write TL;DR summaries: 3-4 bullet points followed by one sentence on why it matters." +
+      SAFETY_SUFFIX,
+    user: `URL: ${url}\n\nContent:\n${pageContent}\n\nSummarize for a busy reader.`,
+    maxTokens: 400,
   });
 
-  if (!res.ok) throw new Error(`AI provider failed: ${res.status}`);
-  const text = (await res.text()).trim();
   return NextResponse.json({ kind: "text", text, sourceUrl: url });
 });
