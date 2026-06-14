@@ -18,6 +18,13 @@ export const metadata: Metadata = {
     description: "Pay-per-use AI tools, settled in cUSD over x402 on Celo.",
     images: ["/og.png"],
   },
+  // Talent Protocol grant application — project ownership verification.
+  verification: {
+    other: {
+      "talentapp:project_verification":
+        "06f5e2d3b599ebd710dc9317671c10c8a2927b5199248a2b54158b6a0c9cf83916aa1000cb46f9b633fa77121a7464823f4139011649d2369520d4a6638c67d6",
+    },
+  },
 };
 
 export default function RootLayout({
