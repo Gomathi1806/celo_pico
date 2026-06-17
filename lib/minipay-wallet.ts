@@ -225,16 +225,7 @@ export async function getWalletAddress(
  * Returns the transaction hash. The server verifies the Transfer log on
  * Celo before running the tool.
  */
-const STABLECOIN_FOR_DIRECT = {
-  celo: {
-    address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
-    decimals: 6,
-  },
-  "celo-alfajores": {
-    address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
-    decimals: 18,
-  },
-} as const;
+import { getToken, type TokenId } from "./payment";
 
 // ERC-20 transfer(address,uint256) selector = 0xa9059cbb
 function encodeErc20Transfer(to: `0x${string}`, amount: bigint): `0x${string}` {
@@ -245,19 +236,21 @@ function encodeErc20Transfer(to: `0x${string}`, amount: bigint): `0x${string}` {
 
 export async function payDirect({
   network,
+  tokenId,
   toAddress,
   amountUsd,
 }: {
   network: SupportedNetwork;
+  tokenId: TokenId;
   toAddress: `0x${string}`;
   amountUsd: number;
 }): Promise<`0x${string}`> {
   if (!window.ethereum) throw new Error("No wallet detected.");
   const address = await getWalletAddress(network);
-  const stable = STABLECOIN_FOR_DIRECT[network];
+  const token = getToken(network, tokenId);
 
-  // Convert USD price → token base units (e.g. $0.05 USDC → 50_000 with 6 decimals)
-  const amount = BigInt(Math.round(amountUsd * 10 ** stable.decimals));
+  // Convert USD price → token base units. USDC has 6 decimals, USDm has 18.
+  const amount = BigInt(Math.round(amountUsd * 10 ** token.decimals));
   const data = encodeErc20Transfer(toAddress, amount);
 
   // MiniPay requires legacy tx format — no maxFeePerGas / maxPriorityFeePerGas.
@@ -266,7 +259,7 @@ export async function payDirect({
     method: "eth_sendTransaction",
     params: [{
       from: address,
-      to: stable.address,
+      to: token.address,
       data,
       value: "0x0",
     }],

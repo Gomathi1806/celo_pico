@@ -7,10 +7,11 @@ import { safeHandler } from "./safe-handler";
 import {
   verifyDirectPayment,
   parsePriceUsd,
+  getToken,
   type SupportedNetwork,
+  type TokenId,
 } from "./payment";
 
-// Alfajores (44787) is not a named export in thirdweb/chains
 const celoAlfajores = defineChain(44787);
 
 export const NETWORK_CHAIN = {
@@ -41,47 +42,29 @@ function getThirdwebFacilitator() {
   });
 }
 
-// USDC (mainnet, EIP-3009) / USDm (Alfajores, EIP-2612) — used for x402 path
-const X402_ASSET = {
-  celo: {
-    address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
-    decimals: 6,
-    eip712: {
-      name: "USD Coin",
-      version: "2",
-      primaryType: "TransferWithAuthorization" as const,
+function priceToAsset(
+  usdPrice: string,
+  network: SupportedNetwork,
+  tokenId: TokenId
+) {
+  const token = getToken(network, tokenId);
+  const amount = Math.round(parsePriceUsd(usdPrice) * 10 ** token.decimals).toString();
+  return {
+    amount,
+    asset: {
+      address: token.address,
+      decimals: token.decimals,
+      eip712: token.eip712,
     },
-  },
-  "celo-alfajores": {
-    address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
-    decimals: 18,
-    eip712: {
-      name: "Celo Dollar",
-      version: "1",
-      primaryType: "Permit" as const,
-    },
-  },
-} as const;
-
-function priceToAsset(usdPrice: string, network: SupportedNetwork) {
-  const asset = X402_ASSET[network];
-  const amount = Math.round(parsePriceUsd(usdPrice) * 10 ** asset.decimals).toString();
-  return { amount, asset };
+  };
 }
 
-/**
- * Dual-path payment handler.
- *
- * Path A — MiniPay (direct transfer):
- *   Client signs eth_sendTransaction(transfer), posts txHash in body.
- *   Server verifies the Transfer log on-chain.
- *   Used because MiniPay does NOT support eth_signTypedData.
- *
- * Path B — Browser wallets (x402):
- *   Client signs an EIP-2612/3009 typed-data permit via thirdweb.
- *   Server settles atomically through thirdweb's facilitator.
- *   Used for MetaMask / Coinbase Wallet / Rabby etc.
- */
+function resolveTokenId(input: unknown): TokenId {
+  const lower = String(input ?? "").toLowerCase();
+  if (lower === "usdc" || lower === "usdm") return lower;
+  return "usdc"; // default — mainnet has USDC; getToken falls back to USDm on testnet
+}
+
 export function createToolHandler(
   toolName: string,
   price: string,
@@ -91,6 +74,7 @@ export function createToolHandler(
     const body = (await req.json()) as Record<string, string>;
     const network: SupportedNetwork =
       (body.network as SupportedNetwork) ?? DEFAULT_NETWORK;
+    const tokenId = resolveTokenId(body.tokenId ?? body.token);
     const chain = NETWORK_CHAIN[network];
 
     // Path A — MiniPay direct-transfer verification
@@ -100,6 +84,7 @@ export function createToolHandler(
         operatorAddress: OPERATOR_ADDRESS,
         requiredUsd: parsePriceUsd(price),
         network,
+        tokenId,
       });
 
       if (!result.valid) {
@@ -123,7 +108,7 @@ export function createToolHandler(
       paymentData,
       payTo: OPERATOR_ADDRESS,
       network: chain,
-      price: priceToAsset(price, network),
+      price: priceToAsset(price, network, tokenId),
       facilitator: getThirdwebFacilitator(),
       routeConfig: {
         description: `pico: ${toolName}`,

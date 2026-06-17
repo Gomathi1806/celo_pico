@@ -36,30 +36,17 @@ import {
   resolveNetwork,
   type SupportedNetwork,
 } from "@/lib/minipay-wallet";
+import { TOKENS, type TokenId, type TokenInfo } from "@/lib/payment";
+import { TOOLS, type Tool, type ToolId } from "@/lib/tools";
 
 const OPERATOR_ADDRESS = (
   process.env.NEXT_PUBLIC_OPERATOR_ADDRESS ??
   "0x0000000000000000000000000000000000000000"
 ) as `0x${string}`;
-import { TOOLS, type Tool, type ToolId } from "@/lib/tools";
 
-// Stablecoin per network. MiniPay's UI copy rules say show "Stablecoin" as
-// a category, not the ticker — symbol kept here for internal logic only.
 const NETWORK_CONFIG = {
-  celo: {
-    name: "Celo",
-    chain: celo,
-    tokenAddress: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
-    tokenSymbol: "USDC",
-    tokenDecimals: 6,
-  },
-  "celo-alfajores": {
-    name: "Alfajores",
-    chain: celoAlfajores,
-    tokenAddress: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
-    tokenSymbol: "USDm",
-    tokenDecimals: 18,
-  },
+  celo: { name: "Celo", chain: celo },
+  "celo-alfajores": { name: "Alfajores", chain: celoAlfajores },
 } as const;
 
 function shortAddress(addr: string): string {
@@ -97,7 +84,11 @@ export function Launcher() {
   const [running, setRunning] = useState(false);
   const [isMiniPay, setIsMiniPay] = useState<boolean | null>(null);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  const [balance, setBalance] = useState<string | null>(null);
+  // Balance per token (e.g. {usdc: "3.59", usdm: "0.00"}).
+  const [balances, setBalances] = useState<Record<TokenId, string>>(
+    {} as Record<TokenId, string>
+  );
+  const [selectedToken, setSelectedToken] = useState<TokenId | null>(null);
 
   const [selectedNetwork, setSelectedNetwork] = useState<SupportedNetwork>(
     () =>
@@ -108,6 +99,10 @@ export function Launcher() {
 
   const config = NETWORK_CONFIG[selectedNetwork];
   const IS_MAINNET = selectedNetwork === "celo";
+  // Tokens available on this network (mainnet: USDC + USDm; testnet: USDm only)
+  const availableTokens: TokenInfo[] = Object.values(TOKENS[selectedNetwork]).filter(
+    (t): t is TokenInfo => !!t
+  );
 
   // Detect any injected provider (polls up to 2s — MiniPay sometimes
   // injects window.ethereum after React mounts).
@@ -121,25 +116,53 @@ export function Launcher() {
 
       try {
         const address = await getWalletAddress(selectedNetwork);
+        if (cancelled) return;
         setWalletAddress(address);
+
+        // Fetch balances for ALL tokens on this network in parallel.
         const publicClient = createPublicClient({
           chain: config.chain,
           transport: http(),
         });
-        const bal = await publicClient.readContract({
-          address: config.tokenAddress,
-          abi: ERC20_ABI,
-          functionName: "balanceOf",
-          args: [address as `0x${string}`],
-        });
-        setBalance(formatUnits(bal, config.tokenDecimals));
+        const balanceEntries = await Promise.all(
+          availableTokens.map(async (token) => {
+            try {
+              const raw = await publicClient.readContract({
+                address: token.address,
+                abi: ERC20_ABI,
+                functionName: "balanceOf",
+                args: [address as `0x${string}`],
+              });
+              return [token.id, formatUnits(raw, token.decimals)] as const;
+            } catch {
+              return [token.id, "0"] as const;
+            }
+          })
+        );
+        if (cancelled) return;
+        const balancesMap = Object.fromEntries(balanceEntries) as Record<TokenId, string>;
+        setBalances(balancesMap);
+
+        // Auto-pick the token with the highest balance as the default —
+        // this is what Celopedia's "single-token UX" guidance expects.
+        const best = availableTokens
+          .map((t) => ({ id: t.id, n: parseFloat(balancesMap[t.id] ?? "0") }))
+          .sort((a, b) => b.n - a.n)[0];
+        setSelectedToken(best?.id ?? availableTokens[0]?.id ?? null);
       } catch (e) {
         console.error("Wallet init failed:", e);
-        setBalance("?");
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedNetwork, config.chain, config.tokenAddress, config.tokenDecimals]);
+    // availableTokens derives from selectedNetwork — listing it explicitly
+    // would re-run on every render because its identity isn't stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNetwork, config.chain]);
+
+  // Resolve the currently-selected token's info + balance for UI display
+  const activeToken: TokenInfo | null =
+    availableTokens.find((t) => t.id === selectedToken) ?? availableTokens[0] ?? null;
+  const activeBalance = activeToken ? balances[activeToken.id] : undefined;
 
   const tool = TOOLS.find((t) => t.id === activeId)!;
 
@@ -168,6 +191,9 @@ export function Launcher() {
 
       let res: Response;
 
+      if (!activeToken) throw new Error("No stablecoin available on this network.");
+      const tokenId = activeToken.id;
+
       if (isMiniPay) {
         // Path A — MiniPay: direct ERC-20 transfer + on-chain verify.
         // MiniPay does NOT support eth_signTypedData, so the x402 flow
@@ -177,6 +203,7 @@ export function Launcher() {
         try {
           txHash = await payDirect({
             network: selectedNetwork,
+            tokenId,
             toAddress: OPERATOR_ADDRESS,
             amountUsd: priceUsd,
           });
@@ -191,6 +218,7 @@ export function Launcher() {
           body: JSON.stringify({
             ...toolInputs,
             network: selectedNetwork,
+            tokenId,
             txHash,
           }),
         });
@@ -202,6 +230,7 @@ export function Launcher() {
         const body = JSON.stringify({
           ...toolInputs,
           network: selectedNetwork,
+          tokenId,
         });
 
         try {
@@ -297,31 +326,67 @@ export function Launcher() {
         </Alert>
       )}
 
-      {/* Stablecoin balance — primary info. Address shown as truncated
-          secondary hint per MiniPay rules (no raw 0x as primary identifier). */}
-      {walletAddress && (
-        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 space-y-1.5">
+      {/* Account + multi-stablecoin picker. Default = highest-balance.
+          Address shown as truncated secondary hint per MiniPay rules. */}
+      {walletAddress && activeToken && (
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 space-y-2">
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-xs text-muted-foreground">Stablecoin balance</span>
+            <span className="text-xs text-muted-foreground">
+              Balance ({activeToken.symbol})
+            </span>
             <span
               className={`font-mono text-base font-semibold ${
-                parseFloat(balance ?? "0") < 0.1
+                parseFloat(activeBalance ?? "0") < 0.1
                   ? "text-destructive"
                   : "text-foreground"
               }`}
             >
-              {balance ? parseFloat(balance).toFixed(2) : "…"}
+              {activeBalance !== undefined ? parseFloat(activeBalance).toFixed(2) : "…"}
             </span>
           </div>
+
+          {/* Token picker — pills, like the Mento/MiniPay reference UX.
+              Only render when >1 token available (no picker on testnet). */}
+          {availableTokens.length > 1 && (
+            <div className="flex items-center gap-1.5 pt-0.5">
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground/70 mr-1">
+                Pay in
+              </span>
+              {availableTokens.map((t) => {
+                const isActive = t.id === activeToken.id;
+                const tokBal = parseFloat(balances[t.id] ?? "0");
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => setSelectedToken(t.id)}
+                    className={`rounded-full border px-2.5 py-0.5 text-[11px] font-mono transition-colors ${
+                      isActive
+                        ? "border-foreground bg-foreground/10 text-foreground"
+                        : "border-border text-muted-foreground hover:border-foreground/40"
+                    }`}
+                    title={`${tokBal.toFixed(2)} ${t.symbol} available`}
+                  >
+                    {t.symbol}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground/70">
             <span>Account</span>
             <span className="font-mono">{shortAddress(walletAddress)}</span>
           </div>
-          {parseFloat(balance ?? "0") < 0.1 && (
+
+          {parseFloat(activeBalance ?? "0") < 0.1 && (
             <div className="pt-1 text-xs text-destructive">
-              ⚠ Not enough balance.{" "}
+              ⚠ Not enough {activeToken.symbol}.{" "}
+              {availableTokens.length > 1 && (
+                <span>Try a different stablecoin above, or </span>
+              )}
               {IS_MAINNET ? (
-                <span>Deposit stablecoin in MiniPay to use pico.</span>
+                <span>deposit more in MiniPay.</span>
               ) : (
                 <a
                   href="https://faucet.celo.org/alfajores"
@@ -329,7 +394,7 @@ export function Launcher() {
                   rel="noopener noreferrer"
                   className="underline"
                 >
-                  Get free testnet stablecoin →
+                  get free testnet stablecoin →
                 </a>
               )}
             </div>
