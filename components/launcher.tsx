@@ -249,16 +249,21 @@ export function Launcher() {
         </div>
       </header>
 
-      {/* No injected wallet detected */}
+      {/* No injected wallet detected at all (browser without any wallet extension) */}
       {isMiniPay === false && (
         <Alert>
-          <AlertTitle>Wallet not detected</AlertTitle>
+          <AlertTitle>No wallet detected</AlertTitle>
           <AlertDescription>
-            pico needs an injected Ethereum wallet (MiniPay on Celo). Open
-            this URL inside the MiniPay app. If you&apos;re already in
-            MiniPay and still see this, try refreshing — the wallet provider
-            is sometimes injected late. Check the browser console for
-            details.
+            pico needs an injected Ethereum wallet. Best experience: open
+            this URL inside the <strong>MiniPay</strong> app on mobile. For
+            desktop testing, install <a
+              href="https://metamask.io/download/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline"
+            >MetaMask</a>, Coinbase Wallet, or Rabby — the app will switch
+            you to Celo and add it to your wallet automatically. Then refresh
+            this page.
           </AlertDescription>
         </Alert>
       )}

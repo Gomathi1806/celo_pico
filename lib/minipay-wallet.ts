@@ -16,9 +16,25 @@ export const DEFAULT_NETWORK = resolveNetwork(
   (process.env.NEXT_PUBLIC_X402_NETWORK ?? "celo-alfajores").trim()
 );
 
+// Full chain config — used by wallet_addEthereumChain when a browser wallet
+// (MetaMask, Coinbase Wallet, etc.) doesn't yet know about Celo.
 const CHAIN_MAP = {
-  celo:            { chainId: 42220, chainIdHex: "0xA4EC" as const },
-  "celo-alfajores": { chainId: 44787, chainIdHex: "0xAEF3" as const },
+  celo: {
+    chainId: 42220,
+    chainIdHex: "0xA4EC" as const,
+    chainName: "Celo Mainnet",
+    nativeCurrency: { name: "CELO", symbol: "CELO", decimals: 18 },
+    rpcUrls: ["https://forno.celo.org"],
+    blockExplorerUrls: ["https://celoscan.io"],
+  },
+  "celo-alfajores": {
+    chainId: 44787,
+    chainIdHex: "0xAEF3" as const,
+    chainName: "Celo Alfajores Testnet",
+    nativeCurrency: { name: "CELO", symbol: "CELO", decimals: 18 },
+    rpcUrls: ["https://alfajores-forno.celo-testnet.org"],
+    blockExplorerUrls: ["https://alfajores.celoscan.io"],
+  },
 } as const;
 
 // Strict MiniPay flag (Opera sets this in the production app)
@@ -27,9 +43,9 @@ export function isMiniPayEnvironment(): boolean {
   return !!(window.ethereum as { isMiniPay?: boolean } | undefined)?.isMiniPay;
 }
 
-// Strict MiniPay detection with polling — checks isMiniPay flag.
-// Polls up to ~2s because MiniPay sometimes injects window.ethereum after
-// React mounts. Rejects MetaMask and other non-MiniPay wallets cleanly.
+// Accept any injected EIP-1193 provider — MiniPay primary, but MetaMask /
+// Coinbase Wallet / Rabby etc. all work in regular browsers for testing.
+// Polls up to ~2s because some wallets inject after React mounts.
 export async function detectInjectedProvider(timeoutMs = 2000): Promise<{
   available: boolean;
   isMiniPay: boolean;
@@ -44,32 +60,16 @@ export async function detectInjectedProvider(timeoutMs = 2000): Promise<{
       const provider = window.ethereum as Record<string, unknown>;
       const isMiniPay = provider.isMiniPay === true;
       const providerKeys = Object.keys(provider).filter((k) => k.startsWith("is"));
-      const result = {
-        available: isMiniPay,  // only count as available if it's MiniPay
-        isMiniPay,
-        providerKeys,
-      };
+      const result = { available: true, isMiniPay, providerKeys };
       // eslint-disable-next-line no-console
-      console.log("[pico] injected provider detected:", { ...result, providerKeys });
-      if (isMiniPay) return result;
-      // Keep polling — MiniPay might inject later, overriding MetaMask
+      console.log("[pico] wallet detected:", result);
+      return result;
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  const provider = (typeof window !== "undefined" ? window.ethereum : undefined) as
-    | Record<string, unknown>
-    | undefined;
-  const providerKeys = provider
-    ? Object.keys(provider).filter((k) => k.startsWith("is"))
-    : [];
   // eslint-disable-next-line no-console
-  console.warn(
-    "[pico] MiniPay not detected after",
-    timeoutMs,
-    "ms. Found providers:",
-    providerKeys
-  );
-  return { available: false, isMiniPay: false, providerKeys };
+  console.warn("[pico] no injected wallet detected after", timeoutMs, "ms");
+  return { available: false, isMiniPay: false, providerKeys: [] };
 }
 
 function getThirdwebClient() {
@@ -102,18 +102,41 @@ export async function getConnectedWallet(
   const provider = window.ethereum;
   if (!provider) throw new Error("No wallet. Open inside MiniPay.");
 
-  const { chainIdHex, chainId } = CHAIN_MAP[network];
+  const chainCfg = CHAIN_MAP[network];
+  const { chainIdHex, chainId } = chainCfg;
 
-  // Switch to Celo if needed
+  // Switch to Celo. If the wallet doesn't know about Celo yet (4902 error,
+  // common in MetaMask first-time), add it via wallet_addEthereumChain.
   try {
     const current = (await provider.request({ method: "eth_chainId" })) as string;
     if (current.toLowerCase() !== chainIdHex.toLowerCase()) {
-      await provider.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: chainIdHex }],
-      });
+      try {
+        await provider.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: chainIdHex }],
+        });
+      } catch (switchErr: unknown) {
+        const code = (switchErr as { code?: number })?.code;
+        if (code === 4902 || code === -32603) {
+          await provider.request({
+            method: "wallet_addEthereumChain",
+            params: [{
+              chainId: chainIdHex,
+              chainName: chainCfg.chainName,
+              nativeCurrency: chainCfg.nativeCurrency,
+              rpcUrls: chainCfg.rpcUrls,
+              blockExplorerUrls: chainCfg.blockExplorerUrls,
+            }],
+          });
+        } else {
+          throw switchErr;
+        }
+      }
     }
-  } catch { /* tx will fail naturally if wrong chain */ }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[pico] chain switch failed — tx will fail if wallet is on wrong chain:", e);
+  }
 
   const accounts = (await provider.request({
     method: "eth_requestAccounts",
