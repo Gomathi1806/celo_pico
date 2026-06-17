@@ -4,10 +4,13 @@ import { celo } from "thirdweb/chains";
 import { facilitator, settlePayment } from "thirdweb/x402";
 import { NextRequest, NextResponse } from "next/server";
 import { safeHandler } from "./safe-handler";
+import {
+  verifyDirectPayment,
+  parsePriceUsd,
+  type SupportedNetwork,
+} from "./payment";
 
-export type SupportedNetwork = "celo" | "celo-alfajores";
-
-// Alfajores (44787) is not a named export in thirdweb/chains — use defineChain
+// Alfajores (44787) is not a named export in thirdweb/chains
 const celoAlfajores = defineChain(44787);
 
 export const NETWORK_CHAIN = {
@@ -25,16 +28,12 @@ export const OPERATOR_ADDRESS = (
   "0x0000000000000000000000000000000000000000"
 ) as `0x${string}`;
 
-// Thirdweb client — uses secretKey server-side (never exposed to client)
 function getServerClient() {
   return createThirdwebClient({
     secretKey: process.env.THIRDWEB_SECRET_KEY ?? "",
   });
 }
 
-// Thirdweb facilitator — handles on-chain settlement via thirdweb's infrastructure.
-// Supports Celo mainnet + Alfajores testnet. cUSD (EIP-2612) and USDC (EIP-3009).
-// No CDP keys or custom facilitator server needed.
 function getThirdwebFacilitator() {
   return facilitator({
     client: getServerClient(),
@@ -42,45 +41,46 @@ function getThirdwebFacilitator() {
   });
 }
 
-// USDC on Celo (Circle, 6 decimals) — MiniPay users primarily hold USDC, not cUSD.
-// Settling in USDC avoids "insufficient funds" errors for users who only have USDC.
-// Both USDC and cUSD are supported by thirdweb's facilitator on Celo.
-const USDC_ASSET = {
+// USDC (mainnet, EIP-3009) / USDm (Alfajores, EIP-2612) — used for x402 path
+const X402_ASSET = {
   celo: {
     address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
     decimals: 6,
     eip712: {
       name: "USD Coin",
       version: "2",
-      primaryType: "TransferWithAuthorization" as const, // EIP-3009
+      primaryType: "TransferWithAuthorization" as const,
     },
   },
-  // Alfajores testnet doesn't have official Circle USDC — fall back to cUSD there
   "celo-alfajores": {
     address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
     decimals: 18,
     eip712: {
       name: "Celo Dollar",
       version: "1",
-      primaryType: "Permit" as const, // EIP-2612
+      primaryType: "Permit" as const,
     },
   },
 } as const;
 
 function priceToAsset(usdPrice: string, network: SupportedNetwork) {
-  const usd = parseFloat(usdPrice.replace("$", ""));
-  const asset = USDC_ASSET[network];
-  const amount = Math.round(usd * 10 ** asset.decimals).toString();
+  const asset = X402_ASSET[network];
+  const amount = Math.round(parsePriceUsd(usdPrice) * 10 ** asset.decimals).toString();
   return { amount, asset };
 }
 
 /**
- * Wraps a Next.js route handler with x402 payment gating via thirdweb.
+ * Dual-path payment handler.
  *
- * Flow:
- *  1. No X-PAYMENT header → return 402 with payment descriptor
- *  2. Client pays (signs permit/EIP-3009 via MiniPay) and retries with X-PAYMENT header
- *  3. settlePayment verifies + settles on Celo → call tool → return result
+ * Path A — MiniPay (direct transfer):
+ *   Client signs eth_sendTransaction(transfer), posts txHash in body.
+ *   Server verifies the Transfer log on-chain.
+ *   Used because MiniPay does NOT support eth_signTypedData.
+ *
+ * Path B — Browser wallets (x402):
+ *   Client signs an EIP-2612/3009 typed-data permit via thirdweb.
+ *   Server settles atomically through thirdweb's facilitator.
+ *   Used for MetaMask / Coinbase Wallet / Rabby etc.
  */
 export function createToolHandler(
   toolName: string,
@@ -93,6 +93,25 @@ export function createToolHandler(
       (body.network as SupportedNetwork) ?? DEFAULT_NETWORK;
     const chain = NETWORK_CHAIN[network];
 
+    // Path A — MiniPay direct-transfer verification
+    if (body.txHash && typeof body.txHash === "string" && body.txHash.startsWith("0x")) {
+      const result = await verifyDirectPayment({
+        txHash: body.txHash as `0x${string}`,
+        operatorAddress: OPERATOR_ADDRESS,
+        requiredUsd: parsePriceUsd(price),
+        network,
+      });
+
+      if (!result.valid) {
+        return NextResponse.json(
+          { error: `Payment invalid: ${result.reason}` },
+          { status: 402 }
+        );
+      }
+      return fn(req, body);
+    }
+
+    // Path B — x402 thirdweb settlement (browser wallets)
     const paymentData =
       req.headers.get("X-PAYMENT") ||
       req.headers.get("PAYMENT-SIGNATURE") ||
@@ -104,8 +123,6 @@ export function createToolHandler(
       paymentData,
       payTo: OPERATOR_ADDRESS,
       network: chain,
-      // Explicitly settle in USDC (mainnet) or cUSD (alfajores) — the user's
-      // balance must be in this asset for payment to succeed.
       price: priceToAsset(price, network),
       facilitator: getThirdwebFacilitator(),
       routeConfig: {
@@ -118,7 +135,6 @@ export function createToolHandler(
       return fn(req, body);
     }
 
-    // 402 — return payment descriptor so client can sign and retry
     return NextResponse.json(result.responseBody, {
       status: result.status,
       headers: result.responseHeaders as Record<string, string>,

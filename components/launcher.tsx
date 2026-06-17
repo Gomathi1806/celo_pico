@@ -32,14 +32,19 @@ import {
   getConnectedWallet,
   getWalletAddress,
   detectInjectedProvider,
+  payDirect,
   resolveNetwork,
   type SupportedNetwork,
 } from "@/lib/minipay-wallet";
+
+const OPERATOR_ADDRESS = (
+  process.env.NEXT_PUBLIC_OPERATOR_ADDRESS ??
+  "0x0000000000000000000000000000000000000000"
+) as `0x${string}`;
 import { TOOLS, type Tool, type ToolId } from "@/lib/tools";
 
-// Payment asset per network — must match what the server settles in (lib/thirdweb-x402.ts).
-// Mainnet: USDC (Circle, 6 decimals) — MiniPay users primarily hold USDC.
-// Alfajores: cUSD (18 decimals) — Circle USDC isn't on Alfajores.
+// Stablecoin per network. MiniPay's UI copy rules say show "Stablecoin" as
+// a category, not the ticker — symbol kept here for internal logic only.
 const NETWORK_CONFIG = {
   celo: {
     name: "Celo",
@@ -52,10 +57,14 @@ const NETWORK_CONFIG = {
     name: "Alfajores",
     chain: celoAlfajores,
     tokenAddress: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
-    tokenSymbol: "cUSD",
+    tokenSymbol: "USDm",
     tokenDecimals: 18,
   },
 } as const;
+
+function shortAddress(addr: string): string {
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
 
 const ERC20_ABI = [
   {
@@ -152,47 +161,67 @@ export function Launcher() {
 
     setRunning(true);
     try {
-      // Get MiniPay wallet connected to thirdweb x402 client
-      let fetchWithPay: Awaited<ReturnType<typeof getConnectedWallet>>["fetchWithPay"];
-      try {
-        ({ fetchWithPay } = await getConnectedWallet(selectedNetwork));
-      } catch (e) {
-        throw new Error("Wallet not available. Open this app inside MiniPay.");
-      }
+      const toolInputs = Object.fromEntries(
+        tool.fields.map((f) => [f.name, inputs[f.name] ?? ""])
+      );
+      const priceUsd = parseFloat(tool.price.replace("$", ""));
 
-      const body = JSON.stringify({
-        ...Object.fromEntries(
-          tool.fields.map((f) => [f.name, inputs[f.name] ?? ""])
-        ),
-        network: selectedNetwork,
-      });
-
-      // x402 protocol — single call:
-      // 1. fetchWithPay sends the request
-      // 2. Server returns 402 with payment descriptor (price, network, payTo)
-      // 3. thirdweb auto-signs the payment (EIP-2612 permit for cUSD, EIP-3009 for USDC)
-      //    — MiniPay shows native sign prompt, no custom UI needed
-      // 4. fetchWithPay retries with X-PAYMENT header
-      // 5. Server settles on Celo via thirdweb facilitator → returns result
-      // 30s timeout so user isn't stuck on a hung signature prompt.
       let res: Response;
-      try {
-        res = await Promise.race([
-          fetchWithPay(tool.endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body,
+
+      if (isMiniPay) {
+        // Path A — MiniPay: direct ERC-20 transfer + on-chain verify.
+        // MiniPay does NOT support eth_signTypedData, so the x402 flow
+        // cannot work inside MiniPay's WebView. Server verifies the
+        // resulting txHash before running the tool.
+        let txHash: `0x${string}`;
+        try {
+          txHash = await payDirect({
+            network: selectedNetwork,
+            toAddress: OPERATOR_ADDRESS,
+            amountUsd: priceUsd,
+          });
+        } catch (e) {
+          const reason = e instanceof Error ? e.message : String(e);
+          throw new Error(`Payment cancelled or failed: ${reason}`);
+        }
+
+        res = await fetch(tool.endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...toolInputs,
+            network: selectedNetwork,
+            txHash,
           }),
-          new Promise<Response>((_, reject) =>
-            setTimeout(
-              () => reject(new Error("Payment timed out after 30s. Did you sign the prompt?")),
-              30_000
-            )
-          ),
-        ]);
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        throw new Error(`Payment failed: ${reason}`);
+        });
+      } else {
+        // Path B — Browser wallet (MetaMask / Coinbase / Rabby): x402
+        // signTypedData flow via thirdweb. Works because regular browser
+        // wallets support EIP-712 properly.
+        const { fetchWithPay } = await getConnectedWallet(selectedNetwork);
+        const body = JSON.stringify({
+          ...toolInputs,
+          network: selectedNetwork,
+        });
+
+        try {
+          res = await Promise.race([
+            fetchWithPay(tool.endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body,
+            }),
+            new Promise<Response>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Payment timed out after 30s. Did you sign the prompt?")),
+                30_000
+              )
+            ),
+          ]);
+        } catch (e) {
+          const reason = e instanceof Error ? e.message : String(e);
+          throw new Error(`Payment failed: ${reason}`);
+        }
       }
 
       if (!res.ok) {
@@ -268,34 +297,31 @@ export function Launcher() {
         </Alert>
       )}
 
-      {/* Wallet + balance (USDC on mainnet, cUSD on Alfajores) */}
+      {/* Stablecoin balance — primary info. Address shown as truncated
+          secondary hint per MiniPay rules (no raw 0x as primary identifier). */}
       {walletAddress && (
-        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs space-y-1">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-muted-foreground">Signing wallet</span>
-            <span className="font-mono truncate max-w-[180px]">
-              {walletAddress}
-            </span>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-muted-foreground">{config.tokenSymbol} balance</span>
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 space-y-1.5">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-xs text-muted-foreground">Stablecoin balance</span>
             <span
-              className={`font-mono font-medium ${
+              className={`font-mono text-base font-semibold ${
                 parseFloat(balance ?? "0") < 0.1
                   ? "text-destructive"
-                  : "text-green-500"
+                  : "text-foreground"
               }`}
             >
-              {balance ?? "…"} {config.tokenSymbol}
+              {balance ? parseFloat(balance).toFixed(2) : "…"}
             </span>
           </div>
+          <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground/70">
+            <span>Account</span>
+            <span className="font-mono">{shortAddress(walletAddress)}</span>
+          </div>
           {parseFloat(balance ?? "0") < 0.1 && (
-            <div className="pt-1 text-destructive">
-              ⚠ Not enough {config.tokenSymbol}.{" "}
+            <div className="pt-1 text-xs text-destructive">
+              ⚠ Not enough balance.{" "}
               {IS_MAINNET ? (
-                <span>
-                  Add {config.tokenSymbol} on Celo to this address to use pico.
-                </span>
+                <span>Deposit stablecoin in MiniPay to use pico.</span>
               ) : (
                 <a
                   href="https://faucet.celo.org/alfajores"
@@ -303,7 +329,7 @@ export function Launcher() {
                   rel="noopener noreferrer"
                   className="underline"
                 >
-                  Get free Alfajores {config.tokenSymbol} →
+                  Get free testnet stablecoin →
                 </a>
               )}
             </div>
@@ -340,7 +366,6 @@ export function Launcher() {
         onChange={setField}
         onRun={run}
         running={running}
-        tokenSymbol={config.tokenSymbol}
       />
 
       {error && (
@@ -364,14 +389,12 @@ function ToolForm({
   onChange,
   onRun,
   running,
-  tokenSymbol,
 }: {
   tool: Tool;
   inputs: Record<string, string>;
   onChange: (name: string, value: string) => void;
   onRun: () => void;
   running: boolean;
-  tokenSymbol: string;
 }) {
   return (
     <Card>
@@ -405,8 +428,7 @@ function ToolForm({
         <Separator />
         <div className="flex items-center justify-between">
           <span className="text-xs text-muted-foreground">
-            Charged:{" "}
-            <span className="font-mono">{tool.price}</span> {tokenSymbol}
+            Charged: <span className="font-mono">{tool.price}</span> in stablecoin (network fee included)
           </span>
           <Button onClick={onRun} disabled={running}>
             {running ? (

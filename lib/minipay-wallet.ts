@@ -217,3 +217,60 @@ export async function getWalletAddress(
   const { address } = await getConnectedWallet(network);
   return address;
 }
+
+/**
+ * Direct ERC-20 transfer — used inside MiniPay since MiniPay does NOT
+ * support eth_signTypedData (Celopedia confirms this is a hard block).
+ *
+ * Returns the transaction hash. The server verifies the Transfer log on
+ * Celo before running the tool.
+ */
+const STABLECOIN_FOR_DIRECT = {
+  celo: {
+    address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
+    decimals: 6,
+  },
+  "celo-alfajores": {
+    address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
+    decimals: 18,
+  },
+} as const;
+
+// ERC-20 transfer(address,uint256) selector = 0xa9059cbb
+function encodeErc20Transfer(to: `0x${string}`, amount: bigint): `0x${string}` {
+  const toPadded = to.slice(2).toLowerCase().padStart(64, "0");
+  const amountPadded = amount.toString(16).padStart(64, "0");
+  return `0xa9059cbb${toPadded}${amountPadded}` as `0x${string}`;
+}
+
+export async function payDirect({
+  network,
+  toAddress,
+  amountUsd,
+}: {
+  network: SupportedNetwork;
+  toAddress: `0x${string}`;
+  amountUsd: number;
+}): Promise<`0x${string}`> {
+  if (!window.ethereum) throw new Error("No wallet detected.");
+  const address = await getWalletAddress(network);
+  const stable = STABLECOIN_FOR_DIRECT[network];
+
+  // Convert USD price → token base units (e.g. $0.05 USDC → 50_000 with 6 decimals)
+  const amount = BigInt(Math.round(amountUsd * 10 ** stable.decimals));
+  const data = encodeErc20Transfer(toAddress, amount);
+
+  // MiniPay requires legacy tx format — no maxFeePerGas / maxPriorityFeePerGas.
+  // Fee abstraction (CIP-64) handles network fees in stablecoin automatically.
+  const txHash = (await window.ethereum.request({
+    method: "eth_sendTransaction",
+    params: [{
+      from: address,
+      to: stable.address,
+      data,
+      value: "0x0",
+    }],
+  })) as `0x${string}`;
+
+  return txHash;
+}

@@ -1,30 +1,37 @@
-import { createPublicClient, http, parseAbi, parseUnits, type Hash } from "viem";
+/**
+ * Server-side on-chain payment verification for the MiniPay path.
+ *
+ * MiniPay does not support EIP-712 signTypedData (per Celopedia's official
+ * MiniPay requirements doc), so the x402/thirdweb signature flow won't work
+ * inside MiniPay. We instead do a two-step:
+ *   1. Client sends an ERC-20 transfer via eth_sendTransaction
+ *   2. Server verifies the resulting txHash represents a valid stablecoin
+ *      transfer to the operator address with the required amount
+ *
+ * Replay protection: used txHashes are stored in Redis with a 7-day TTL.
+ */
+
+import { createPublicClient, http, parseUnits, type Hash } from "viem";
 import { celo, celoAlfajores } from "viem/chains";
 import { getRedis } from "./upstash";
 
-export const CUSD_ADDRESS = {
-  celo: "0x765DE816845861e75A25fCA122bb6898B8B1282a" as `0x${string}`,
-  "celo-alfajores": "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
+export const STABLECOIN = {
+  celo: {
+    address: "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as `0x${string}`,
+    symbol: "USDC",
+    decimals: 6,
+  },
+  "celo-alfajores": {
+    address: "0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1" as `0x${string}`,
+    symbol: "USDm",
+    decimals: 18,
+  },
 } as const;
 
-export const CEUR_ADDRESS = {
-  celo: "0xD8763CBa276a3738E6DE85b4b3bF5FDed6D6cA73" as `0x${string}`,
-  "celo-alfajores": "0x10c892A6EC43a53E45D0B916B4b7D383B1b78470" as `0x${string}`,
-} as const;
-
-// cUSD and cEUR both have 18 decimals (Mento standard)
-const DECIMALS = 18;
-
-// Keccak256 of "Transfer(address,address,uint256)"
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as `0x${string}`;
 
-const ERC20_ABI = parseAbi([
-  "event Transfer(address indexed from, address indexed to, uint256 value)",
-]);
-
 export type SupportedNetwork = "celo" | "celo-alfajores";
-export type SupportedToken = "cusd" | "ceur";
 
 function getPublicClient(network: SupportedNetwork) {
   return createPublicClient({
@@ -33,41 +40,25 @@ function getPublicClient(network: SupportedNetwork) {
   });
 }
 
-function getTokenAddress(
-  token: SupportedToken,
-  network: SupportedNetwork
-): `0x${string}` {
-  return token === "cusd" ? CUSD_ADDRESS[network] : CEUR_ADDRESS[network];
-}
-
 export type PaymentVerification =
   | { valid: true; payer: `0x${string}` }
   | { valid: false; reason: string };
 
-/**
- * Verifies that a txHash represents a successful cUSD (or cEUR) transfer
- * to the operator address of at least the required amount.
- *
- * Also checks Redis to prevent the same txHash being used twice (replay attack).
- */
-export async function verifyPayment({
+export async function verifyDirectPayment({
   txHash,
   operatorAddress,
   requiredUsd,
   network,
-  token = "cusd",
 }: {
   txHash: Hash;
   operatorAddress: `0x${string}`;
   requiredUsd: number;
   network: SupportedNetwork;
-  token?: SupportedToken;
 }): Promise<PaymentVerification> {
-  // 1. Replay-attack prevention via Redis
+  // 1. Replay-attack prevention
   const redis = getRedis();
   if (redis) {
     const key = `pico:used-tx:${txHash.toLowerCase()}`;
-    // SET NX — only succeeds if key doesn't exist; TTL 7 days
     const set = await redis.set(key, "1", { nx: true, ex: 60 * 60 * 24 * 7 });
     if (set === null) {
       return { valid: false, reason: "Transaction already used." };
@@ -75,8 +66,8 @@ export async function verifyPayment({
   }
 
   const client = getPublicClient(network);
-  const tokenAddress = getTokenAddress(token, network);
-  const requiredAmount = parseUnits(requiredUsd.toFixed(6), DECIMALS);
+  const stable = STABLECOIN[network];
+  const requiredAmount = parseUnits(requiredUsd.toFixed(stable.decimals), stable.decimals);
 
   let receipt: Awaited<ReturnType<typeof client.getTransactionReceipt>>;
   try {
@@ -89,56 +80,35 @@ export async function verifyPayment({
     return { valid: false, reason: "Transaction failed on-chain." };
   }
 
-  // 2. Find a Transfer log from the cUSD/cEUR contract to the operator
   for (const log of receipt.logs) {
     if (
-      log.address.toLowerCase() !== tokenAddress.toLowerCase() ||
+      log.address.toLowerCase() !== stable.address.toLowerCase() ||
       log.topics[0] !== TRANSFER_TOPIC ||
       log.topics.length < 3
     ) {
       continue;
     }
 
-    // topics[2] = to address (padded to 32 bytes)
-    const toAddress = ("0x" +
-      log.topics[2]!.slice(26).toLowerCase()) as `0x${string}`;
-
+    const toAddress = ("0x" + log.topics[2]!.slice(26).toLowerCase()) as `0x${string}`;
     if (toAddress !== operatorAddress.toLowerCase()) continue;
 
-    // Decode the value from the data field
-    try {
-      const [decoded] = client.chain // use the ABI decoder
-        ? decodeTransferLog(log.data)
-        : [BigInt(log.data)];
-
-      if (decoded >= requiredAmount) {
-        // topics[1] = from address
-        const payer = ("0x" +
-          log.topics[1]!.slice(26)) as `0x${string}`;
-        return { valid: true, payer };
-      } else {
-        return {
-          valid: false,
-          reason: `Underpayment: got ${decoded} wei, need ${requiredAmount} wei.`,
-        };
-      }
-    } catch {
-      return { valid: false, reason: "Could not decode Transfer log." };
+    const value = BigInt(log.data);
+    if (value >= requiredAmount) {
+      const payer = ("0x" + log.topics[1]!.slice(26)) as `0x${string}`;
+      return { valid: true, payer };
     }
+    return {
+      valid: false,
+      reason: `Underpayment: got ${value} wei, need ${requiredAmount} wei.`,
+    };
   }
 
   return {
     valid: false,
-    reason: `No ${token.toUpperCase()} Transfer to operator found in this transaction.`,
+    reason: `No ${stable.symbol} Transfer to operator found in this transaction.`,
   };
 }
 
-function decodeTransferLog(data: `0x${string}`): [bigint] {
-  // data is a single uint256 — 32 bytes hex
-  return [BigInt(data)];
-}
-
-/** Price string like "$0.05" → number 0.05 */
 export function parsePriceUsd(price: string): number {
   return parseFloat(price.replace("$", ""));
 }
