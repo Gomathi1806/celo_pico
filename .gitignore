@@ -36,3 +36,6 @@ yarn-error.log*
 
 # turbopack
 .turbo
+
+# AI coding-agent skills (regenerated via npx skills add)
+.agents/
